@@ -34,3 +34,20 @@ class PredictionResponse(BaseModel):
     obesity_whtr: float
     obesity_whtr_category: str
     obesity_top_factors: list
+
+class AlertRequest(BaseModel):
+    heart_risk: float = 0.0
+    diabetes_risk: float = 0.0
+    obesity_risk: float = 0.0
+    user_name: Optional[str] = None
+
+    model_config = {
+        "populate_by_name": True,
+        "extra": "ignore"
+    }
+
+class AlertResponse(BaseModel):
+    sent: bool
+    sent_count: int
+    recipient_count: int
+    message: str

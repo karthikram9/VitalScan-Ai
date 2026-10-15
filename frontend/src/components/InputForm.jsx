@@ -446,8 +446,8 @@ const InputForm = () => {
                         "User",
                         data.heart_risk_percent,
                         data.diabetes_risk_percent,
-                        data.obesity_risk_percent || 0,
-                        [])
+                        data.obesity_risk_percent || 0
+                    )
                 } catch (e) {
                     console.log("Alert notification not sent:", e)
                 }

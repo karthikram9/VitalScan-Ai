@@ -1,13 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { RadialBarChart, RadialBar, PolarAngleAxis } from 'recharts';
-import { predictRisk, sendFamilyAlerts } from '../api';
-import { Activity, Apple, Dumbbell, Download } from 'lucide-react';
+import { predictRisk, sendAlert } from '../api';
+import { Activity, Apple, Dumbbell, Download, Bell } from 'lucide-react';
 import { STYLES } from '../utils/styles';
-import { collection, getDocs } from 'firebase/firestore'
-import { firebaseDB } from '../firebase'
 import { getAuth } from 'firebase/auth'
-import { sendAlertEmails } from '../utils/emailService'
 import { generateHealthReport } from '../utils/reportGenerator'
 
 const getRiskColor = (score) => {
@@ -58,6 +55,8 @@ const ResultsDashboard = () => {
     const location = useLocation();
     const navigate = useNavigate();
     const [simData, setSimData] = useState(location.state?.originalData || {});
+    const [sendingAlert, setSendingAlert] = useState(false);
+    const [alertMessage, setAlertMessage] = useState(null);
 
     // Read results from location.state or sessionStorage
     const [results, setResults] = useState(() => {
@@ -65,21 +64,14 @@ const ResultsDashboard = () => {
             JSON.parse(sessionStorage.getItem('vitalResults') || '{}')
     });
 
-    // Log results when they change
+    // Log results when they change (read-only, no side effects)
     useEffect(() => {
         if (results && Object.keys(results).length > 0) {
             console.log("Results updated:", results);
-            const heartRisk = results.heart_risk_percent || 0;
-            const diabetesRisk = results.diabetes_risk_percent || 0;
-            const obesityRisk = results.obesity_risk_percent || 0;
-            console.log("Heart Risk:", heartRisk);
-            console.log("Diabetes Risk:", diabetesRisk);
-            console.log("Obesity Risk:", obesityRisk);
-            triggerAlertEmails(heartRisk, diabetesRisk, obesityRisk);
         }
     }, [results]);
 
-    // Debounced simulation effect — only runs when simData has real form data
+    // Debounced simulation effect — only computes real-time score updates, zero email side effects
     useEffect(() => {
         // If simData is empty (direct page load / refresh), skip the API call
         if (!simData || Object.keys(simData).length === 0) return;
@@ -99,16 +91,6 @@ const ResultsDashboard = () => {
                 const newResults = await predictRisk(simulatedData);
                 console.log("Simulation results:", newResults);
                 setResults(newResults);
-                triggerFamilyAlerts(
-                    newResults.heart_risk_percent,
-                    newResults.diabetes_risk_percent,
-                    newResults.obesity_risk_percent
-                );
-                triggerAlertEmails(
-                    newResults.heart_risk_percent,
-                    newResults.diabetes_risk_percent,
-                    newResults.obesity_risk_percent
-                );
             } catch (err) {
                 console.error("Simulation error:", err);
             }
@@ -151,74 +133,41 @@ const ResultsDashboard = () => {
         }
     };
 
-    const triggerFamilyAlerts = async (heartRisk, diabetesRisk, obesityRisk) => {
-        try {
-            const auth = getAuth()
-            const user = auth.currentUser
-            if (!user) return
+    const handleSendFamilyAlert = async () => {
+        const heart = results?.heart_risk_percent ?? 0;
+        const diabetes = results?.diabetes_risk_percent ?? 0;
+        const obesity = results?.obesity_risk_percent ?? 0;
 
-            const snap = await getDocs(
-                collection(firebaseDB, 'users', user.uid, 'familyAlerts')
-            )
-            const emails = snap.docs.map(d => d.data().email).filter(Boolean)
-            if (emails.length === 0) return
+        const maxRisk = Math.max(heart, diabetes, obesity);
+        const confirmMsg = maxRisk >= 70
+            ? `Your evaluation indicates HIGH RISK (${maxRisk.toFixed(1)}%). Send emergency health alert emails to your registered family contacts?`
+            : `Your risk scores are currently below the high-risk threshold (highest score: ${maxRisk.toFixed(1)}%). Do you want to send emergency alerts to your registered family contacts anyway?`;
 
-            const userName = user.displayName || user.email
-
-            const result = await sendFamilyAlerts(
-                userName,
-                emails,
-                heartRisk,
-                diabetesRisk,
-                obesityRisk
-            )
-
-            if (result.sent) {
-                console.log('Family alerts sent to:', result.sent_to)
-            } else {
-                console.log('No alert sent:', result.reason)
-            }
-        } catch (e) {
-            console.error('Alert trigger error:', e)
+        if (!window.confirm(confirmMsg)) {
+            return;
         }
-    }
 
-    const triggerAlertEmails = async (heartRisk, diabetesRisk, obesityRisk) => {
+        setSendingAlert(true);
+        setAlertMessage(null);
         try {
-            const auth = getAuth()
-            const user = auth.currentUser
-            if (!user) return
+            const auth = getAuth();
+            const user = auth.currentUser;
+            const userName = user?.displayName || user?.email || 'User';
 
-            const userName = user.displayName || 'VitalScan User'
-            const userEmail = user.email
-
-            // Load family contacts from Firestore
-            const snap = await getDocs(
-                collection(firebaseDB, 'users', user.uid, 'familyAlerts')
-            )
-            const familyContacts = snap.docs.map(d => ({
-                name: d.data().name,
-                email: d.data().email
-            })).filter(c => c.email)
-
-            const result = await sendAlertEmails(
-                userName,
-                userEmail,
-                familyContacts,
-                heartRisk,
-                diabetesRisk,
-                obesityRisk
-            )
-
-            if (result.sent) {
-                console.log('Emails sent:', result.results)
+            const response = await sendAlert(userName, heart, diabetes, obesity);
+            if (response.sent) {
+                setAlertMessage({ type: 'success', text: response.message || 'Alert successfully dispatched to family contacts.' });
             } else {
-                console.log('No emails sent:', result.reason)
+                setAlertMessage({ type: 'info', text: response.message || 'No alerts were dispatched.' });
             }
-        } catch (e) {
-            console.error('Alert trigger error:', e)
+        } catch (err) {
+            console.error('Alert send error:', err);
+            setAlertMessage({ type: 'error', text: err.message || 'Failed to dispatch alert.' });
+        } finally {
+            setSendingAlert(false);
+            setTimeout(() => setAlertMessage(null), 6000);
         }
-    }
+    };
 
     if (!results || !results.heart_risk_percent) {
         return (
@@ -325,7 +274,28 @@ const ResultsDashboard = () => {
                     <Download size={20} />
                     Download Lab Report
                 </button>
+
+                <button
+                    onClick={handleSendFamilyAlert}
+                    disabled={sendingAlert}
+                    className="flex-1 flex items-center justify-center gap-2 py-4 bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 hover:border-rose-500/60 text-rose-300 hover:text-white rounded-xl font-semibold transition-all active:scale-[0.98] text-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    <Bell size={20} />
+                    {sendingAlert ? 'Sending...' : 'Send Family Alert'}
+                </button>
             </div>
+
+            {alertMessage && (
+                <div className={`mt-4 p-4 rounded-xl text-center text-sm font-medium border transition-all ${
+                    alertMessage.type === 'success'
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                        : alertMessage.type === 'error'
+                        ? 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+                        : 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+                }`}>
+                    {alertMessage.text}
+                </div>
+            )}
 
             <p className="text-center text-gray-500 text-sm mt-12 mb-4">
                 * Educational only. Not a medical diagnosis. Consult a doctor.

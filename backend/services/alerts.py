@@ -69,43 +69,59 @@ For more information visit your VitalScan dashboard.
 
 def send_family_alerts(user_name, family_emails, heart_risk, diabetes_risk, obesity_risk):
     if not should_send_alert(heart_risk, diabetes_risk, obesity_risk):
-        print("Risk scores below threshold. No alert sent.")
-        return {"sent": False, "reason": "Risk below threshold"}
+        return {"sent": False, "sent_to": [], "failed": [], "reason": "Risk below threshold"}
 
     if not ALERT_EMAIL or not ALERT_PASSWORD:
-        print("Email credentials not configured in .env")
-        return {"sent": False, "reason": "Email not configured"}
+        return {"sent": False, "sent_to": [], "failed": [], "reason": "Email not configured"}
 
     if not family_emails:
-        print("No family contacts to alert.")
-        return {"sent": False, "reason": "No family contacts"}
+        return {"sent": False, "sent_to": [], "failed": [], "reason": "No family contacts"}
 
-    subject = f"🚨 VitalScan Health Alert — {user_name} Needs Attention"
-    body = build_email_body(user_name, heart_risk, diabetes_risk, obesity_risk)
+    # Sanitize user_name to prevent header injection
+    clean_name = str(user_name).replace("\r", "").replace("\n", "").strip() or "User"
+    subject = f"🚨 VitalScan Health Alert — {clean_name} Needs Attention"
+    body = build_email_body(clean_name, heart_risk, diabetes_risk, obesity_risk)
 
     sent_to = []
     failed = []
 
-    for email in family_emails:
-        try:
-            msg = MIMEMultipart()
-            msg["From"] = ALERT_EMAIL
-            msg["To"] = email
-            msg["Subject"] = subject
-            msg.attach(MIMEText(body, "plain"))
+    # Sanitize and deduplicate recipient emails (max 5)
+    clean_recipients = []
+    for item in family_emails:
+        addr = item.get("email") if isinstance(item, dict) else str(item)
+        addr = addr.replace("\r", "").replace("\n", "").strip().lower()
+        if addr and "@" in addr and "." in addr and addr not in clean_recipients:
+            clean_recipients.append(addr)
+        if len(clean_recipients) >= 5:
+            break
 
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-                server.login(ALERT_EMAIL, ALERT_PASSWORD)
-                server.sendmail(ALERT_EMAIL, email, msg.as_string())
+    if not clean_recipients:
+        return {"sent": False, "sent_to": [], "failed": [], "reason": "No valid recipient email addresses"}
 
-            sent_to.append(email)
-            print(f"Alert sent to {email}")
-        except Exception as e:
-            failed.append(email)
-            print(f"Failed to send to {email}: {e}")
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(ALERT_EMAIL, ALERT_PASSWORD)
+            for email in clean_recipients:
+                try:
+                    msg = MIMEMultipart()
+                    msg["From"] = ALERT_EMAIL
+                    msg["To"] = email
+                    msg["Subject"] = subject
+                    msg.attach(MIMEText(body, "plain"))
+                    server.sendmail(ALERT_EMAIL, email, msg.as_string())
+                    sent_to.append(email)
+                except Exception as e:
+                    failed.append(email)
+    except Exception as smtp_err:
+        return {
+            "sent": False,
+            "sent_to": sent_to,
+            "failed": clean_recipients,
+            "reason": f"SMTP connection failed: {type(smtp_err).__name__}"
+        }
 
     return {
-        "sent": True,
+        "sent": len(sent_to) > 0,
         "sent_to": sent_to,
         "failed": failed,
         "heart_risk": heart_risk,

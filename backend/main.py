@@ -6,14 +6,14 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from starlette.responses import JSONResponse
-from schemas import PredictionRequest, PredictionResponse
+from schemas import PredictionRequest, PredictionResponse, AlertRequest, AlertResponse
 from services.prediction import (
     get_heart_risk_prediction,
     get_diabetes_risk_prediction,
     get_obesity_risk_score,
     get_all_predictions)
 from services.diet import generate_diet_plan
-from services.alerts import send_family_alerts
+from services.alerts import send_family_alerts, should_send_alert
 import firebase_admin
 from firebase_admin import credentials, firestore, auth
 import redis
@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import smtplib
+import asyncio
 import traceback
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -30,6 +31,20 @@ load_dotenv()
 
 # ── Rate Limiter ──
 limiter = Limiter(key_func=get_remote_address)
+
+def get_user_rate_limit_key(request: Request) -> str:
+    token = request.headers.get("Authorization", "")
+    if token.startswith("Bearer "):
+        token = token[7:]
+    if token:
+        try:
+            decoded = auth.verify_id_token(token)
+            uid = decoded.get("uid")
+            if uid:
+                return f"user:{uid}"
+        except Exception:
+            pass
+    return get_remote_address(request)
 
 # ── FastAPI App ──
 app = FastAPI(title="VitalScan API")
@@ -264,93 +279,93 @@ async def diet(request: Request):
         print("[X] DIET ERROR:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── Send Alert Endpoint ──
-@app.post("/send-alert")
-async def send_alert(request: Request):
+# ── Secure Send Alert Endpoint ──
+@app.post("/send-alert", response_model=AlertResponse)
+@limiter.limit("5/minute", key_func=get_user_rate_limit_key)
+async def send_alert(request: Request, body: AlertRequest):
     try:
         uid = verify_token(request)
         if not uid:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+            raise HTTPException(status_code=401, detail="Unauthorized: Valid authentication required")
 
-        body = await request.json()
-        user_name = body.get("userName", "User")
-        heart_risk = body.get("heartRisk", 0)
-        diabetes_risk = body.get("diabetesRisk", 0)
-        obesity_risk = body.get("obesityRisk", 0)
-        family_emails = body.get("familyEmails", [])
+        # Threshold check: only alert if at least one risk is >= 70
+        if not should_send_alert(body.heart_risk, body.diabetes_risk, body.obesity_risk):
+            return AlertResponse(
+                sent=False,
+                sent_count=0,
+                recipient_count=0,
+                message="Risk scores are below high-risk threshold (70%). No alert required."
+            )
 
-        if not family_emails:
-            return {"sent": 0, "message": "No family emails"}
+        # Retrieve registered emergency contacts and profile name from Firestore
+        authorized_contacts = []
+        user_name = "User"
 
-        smtp_email = os.getenv("ALERT_EMAIL")
-        smtp_pass = os.getenv("ALERT_PASSWORD")
-
-        if not smtp_email or not smtp_pass:
-            return {"sent": 0, "message": "SMTP not configured"}
-
-        sent_count = 0
-        for recipient in family_emails:
+        if FIREBASE_AVAILABLE and db_firestore:
             try:
-                msg = MIMEMultipart()
-                msg["From"] = smtp_email
-                msg["To"] = recipient["email"]
-                msg["Subject"] = f"Health Alert: {user_name}'s Risk Score Requires Attention"
+                # Retrieve user's verified profile name
+                user_doc = db_firestore.collection("users").document(uid).get()
+                if user_doc.exists:
+                    user_data = user_doc.to_dict()
+                    user_name = user_data.get("name") or user_data.get("displayName") or "User"
 
-                body_text = f"""
-Dear {recipient.get('name', 'Family Member')},
+                # Retrieve registered family contacts
+                contacts_stream = db_firestore.collection("users").document(uid).collection("familyAlerts").stream()
+                for doc in contacts_stream:
+                    cdata = doc.to_dict()
+                    c_email = cdata.get("email", "").strip().lower()
+                    if c_email and "@" in c_email and "." in c_email:
+                        authorized_contacts.append({
+                            "name": cdata.get("name", "Family Member"),
+                            "email": c_email
+                        })
+            except Exception as fe:
+                print(f"[!] Firestore contact lookup error: {fe}")
 
-This is an automated health alert from VitalScan.
+        # Fallback to sanitized client user_name if not in Firestore
+        if user_name == "User" and body.user_name:
+            user_name = str(body.user_name).strip()[:50]
 
-{user_name}'s latest health risk assessment shows:
+        # Deduplicate and cap contacts at 5
+        seen = set()
+        clean_contacts = []
+        for c in authorized_contacts:
+            if c["email"] not in seen:
+                seen.add(c["email"])
+                clean_contacts.append(c)
+            if len(clean_contacts) >= 5:
+                break
 
-Heart Disease Risk  : {heart_risk}%
-Diabetes Risk       : {diabetes_risk}%
-Obesity Risk        : {obesity_risk}%
+        if not clean_contacts:
+            return AlertResponse(
+                sent=False,
+                sent_count=0,
+                recipient_count=0,
+                message="No registered family contacts found in your profile. Please add contacts in Dashboard."
+            )
 
-One or more scores indicate HIGH RISK.
-We strongly recommend consulting a doctor soon.
+        # Offload synchronous SMTP dispatch to thread pool to avoid blocking the async event loop
+        result = await asyncio.to_thread(
+            send_family_alerts,
+            user_name=user_name,
+            family_emails=clean_contacts,
+            heart_risk=body.heart_risk,
+            diabetes_risk=body.diabetes_risk,
+            obesity_risk=body.obesity_risk
+        )
 
-This alert was sent because {user_name} added your email for family health monitoring on VitalScan.
+        sent_count = len(result.get("sent_to", []))
+        is_sent = result.get("sent", False) and sent_count > 0
 
-— VitalScan Health Intelligence
-* Educational tool only. Not a medical diagnosis. Consult a doctor for clinical evaluation.
-                """
+        return AlertResponse(
+            sent=is_sent,
+            sent_count=sent_count,
+            recipient_count=len(clean_contacts),
+            message=f"Alerts sent to {sent_count} of {len(clean_contacts)} registered contacts" if is_sent else result.get("reason", "Failed to send alerts")
+        )
 
-                msg.attach(MIMEText(body_text, "plain"))
-
-                with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-                    server.login(smtp_email, smtp_pass)
-                    server.send_message(msg)
-
-                sent_count += 1
-                print(f"[OK] Alert sent to {recipient['email']}")
-
-            except Exception as email_err:
-                print(f"[X] Email failed: {email_err}")
-
-        return {
-            "sent": sent_count,
-            "total": len(family_emails),
-            "message": f"Alerts sent to {sent_count} recipients"
-        }
-
+    except HTTPException:
+        raise
     except Exception as e:
         print("[X] ALERT ERROR:", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-class AlertRequest(BaseModel):
-    user_name: str
-    family_emails: list[str]
-    heart_risk: float
-    diabetes_risk: float
-    obesity_risk: float
-
-@app.post("/send-alerts")
-async def send_alerts(request: AlertRequest):
-    result = send_family_alerts(
-        user_name=request.user_name,
-        family_emails=request.family_emails,
-        heart_risk=request.heart_risk,
-        diabetes_risk=request.diabetes_risk,
-        obesity_risk=request.obesity_risk
-    )
-    return result
+        raise HTTPException(status_code=500, detail="Internal server error during alert dispatch")

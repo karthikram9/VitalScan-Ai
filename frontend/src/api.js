@@ -97,10 +97,11 @@ export const getDietPlan = async (
 
 export const sendAlert = async (
   userName, heartRisk,
-  diabetesRisk, obesityRisk,
-  familyEmails) => {
+  diabetesRisk, obesityRisk) => {
   const token = await getToken()
-  if (!token) return
+  if (!token) {
+    throw new Error("Authentication required to send health alerts")
+  }
 
   const response = await fetch(
     `${BASE_URL}/send-alert`, {
@@ -113,10 +114,15 @@ export const sendAlert = async (
       userName,
       heartRisk,
       diabetesRisk,
-      obesityRisk,
-      familyEmails
+      obesityRisk
     })
   })
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}))
+    throw new Error(errorData.detail || `Alert failed with status ${response.status}`)
+  }
+
   return response.json()
 }
 
@@ -128,21 +134,9 @@ export const sendFamilyAlerts = async (
   obesityRisk
 ) => {
   try {
-    const response = await fetch(`${BASE_URL}/send-alerts`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        user_name: userName,
-        family_emails: familyEmails,
-        heart_risk: heartRisk,
-        diabetes_risk: diabetesRisk,
-        obesity_risk: obesityRisk
-      })
-    })
-    const data = await response.json()
-    return data
+    return await sendAlert(userName, heartRisk, diabetesRisk, obesityRisk)
   } catch (e) {
     console.error('Alert send error:', e)
-    return { sent: false, reason: e.message }
+    return { sent: false, sent_count: 0, recipient_count: 0, message: e.message }
   }
 }
