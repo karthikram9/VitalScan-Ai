@@ -6,6 +6,6 @@ redis
 python-dotenv
 joblib
 numpy
-scikit-learn
+scikit-learn==1.8.0
 pandas
 pydantic
