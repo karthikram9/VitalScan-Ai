@@ -5,8 +5,13 @@ __pycache__/
 *.pyd
 *.pyw
 
+# Virtual environments
+.venv/
+venv/
+
 # ML Models (binary, large files)
 *.pkl
+!backend/gradient_boosting_model.pkl
 *.joblib
 *.h5
 *.model
@@ -19,6 +24,7 @@ __pycache__/
 # Environment secrets
 .env
 .env.*
+!.env.example
 *.env
 
 # Node / Frontend

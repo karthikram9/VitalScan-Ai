@@ -2,6 +2,7 @@ serviceAccountKey.json
 .env
 __pycache__/
 *.pkl
+!gradient_boosting_model.pkl
 *.csv
 *.pyc
 .pytest_cache/
